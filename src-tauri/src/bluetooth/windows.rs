@@ -229,6 +229,38 @@ impl WindowsBluetoothConnector {
         Ok(())
     }
 
+    /// Send an ACK packet back to the device
+    /// This is required by the bidirectional protocol - client must ACK device responses
+    /// ACK format: START + [0x01, 1-seq, 0,0,0,0, checksum] + END
+    fn send_ack(&mut self, received_seq: u8) -> BluetoothResult<()> {
+        let next_seq = 1 - received_seq;
+        let ack_payload = vec![0x01, next_seq, 0, 0, 0, 0]; // DATA_TYPE::ACK = 0x01
+        let checksum: u8 = ack_payload.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+
+        let mut packet = vec![START_MARKER];
+        packet.extend(&ack_payload);
+        packet.push(checksum);
+        packet.push(END_MARKER);
+
+        let result = unsafe {
+            send(
+                self.socket,
+                packet.as_ptr(),
+                packet.len() as i32,
+                0,
+            )
+        };
+
+        if result < 0 {
+            let err = unsafe { WSAGetLastError() };
+            tracing::warn!("Failed to send ACK: {}", err.0);
+        } else {
+            tracing::debug!("Sent ACK (seq={})", next_seq);
+        }
+
+        Ok(())
+    }
+
     /// Wait for ACK response from headphones with timeout
     /// The protocol uses START_MARKER ('>') and END_MARKER ('<') for message framing
     /// Returns the next sequence number from the ACK (if received)
@@ -299,6 +331,8 @@ impl WindowsBluetoothConnector {
 
                         if data_type == ACK_DATA_TYPE {
                             tracing::info!("ACK received: next_seq={}, {} bytes total", next_seq, total_received);
+                            // Send ACK back to device (bidirectional protocol requirement)
+                            self.send_ack(next_seq)?;
                             return Ok(Some(next_seq));
                         } else {
                             // Not an ACK, might be a data response - log and continue

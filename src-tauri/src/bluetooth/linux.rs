@@ -12,6 +12,11 @@ use std::os::unix::io::RawFd;
 const BTPROTO_RFCOMM: libc::c_int = 3;
 const AF_BLUETOOTH: libc::c_int = 31;
 
+// Protocol markers for message framing
+const START_MARKER: u8 = 0x3E; // '>'
+const END_MARKER: u8 = 0x3C;   // '<'
+const ACK_DATA_TYPE: u8 = 0x01;
+
 // RFCOMM socket address structure
 #[repr(C)]
 struct SockaddrRc {
@@ -60,6 +65,116 @@ impl LinuxBluetoothConnector {
         // TODO: Implement proper SDP lookup
         // Sony headphones typically use channel 9 or similar
         Ok(9)
+    }
+
+    /// Send an ACK packet back to the device
+    /// This is required by the bidirectional protocol - client must ACK device responses
+    fn send_ack(&self, fd: RawFd, received_seq: u8) -> BluetoothResult<()> {
+        let next_seq = 1 - received_seq;
+        let ack_payload = vec![0x01, next_seq, 0, 0, 0, 0]; // DATA_TYPE::ACK = 0x01
+        let checksum: u8 = ack_payload.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+
+        let mut packet = vec![START_MARKER];
+        packet.extend(&ack_payload);
+        packet.push(checksum);
+        packet.push(END_MARKER);
+
+        let result = unsafe {
+            libc::send(
+                fd,
+                packet.as_ptr() as *const libc::c_void,
+                packet.len(),
+                0,
+            )
+        };
+
+        if result < 0 {
+            tracing::warn!("Failed to send ACK: {}", std::io::Error::last_os_error());
+        } else {
+            tracing::debug!("Sent ACK (seq={})", next_seq);
+        }
+
+        Ok(())
+    }
+
+    /// Wait for ACK response from headphones with timeout
+    fn wait_for_ack(&self, fd: RawFd) -> BluetoothResult<Option<u8>> {
+        // Set receive timeout
+        let timeout = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &timeout as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+
+        let mut buffer = Vec::new();
+        let mut found_start = false;
+        let mut total_received = 0;
+
+        loop {
+            let mut chunk = [0u8; 256];
+            let n = unsafe {
+                libc::recv(
+                    fd,
+                    chunk.as_mut_ptr() as *mut libc::c_void,
+                    chunk.len(),
+                    0,
+                )
+            };
+
+            if n <= 0 {
+                // Timeout or error
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut {
+                        tracing::debug!("ACK timeout after {} bytes", total_received);
+                    } else {
+                        tracing::warn!("ACK receive error: {}", err);
+                    }
+                }
+                break;
+            }
+
+            total_received += n as usize;
+
+            for &byte in &chunk[..n as usize] {
+                if byte == START_MARKER {
+                    found_start = true;
+                    buffer.clear();
+                } else if byte == END_MARKER && found_start {
+                    if buffer.len() >= 2 {
+                        let data_type = buffer[0];
+                        let next_seq = buffer[1];
+
+                        if data_type == ACK_DATA_TYPE {
+                            tracing::info!("ACK received: next_seq={}, {} bytes total", next_seq, total_received);
+                            // Send ACK back to device (bidirectional protocol requirement)
+                            self.send_ack(fd, next_seq)?;
+                            return Ok(Some(next_seq));
+                        } else {
+                            tracing::debug!("Received non-ACK response: type=0x{:02X}, {} bytes", data_type, buffer.len());
+                        }
+                    }
+                    return Ok(None);
+                } else if found_start {
+                    buffer.push(byte);
+                }
+            }
+
+            if total_received > 4096 {
+                tracing::warn!("ACK response too large, stopping");
+                break;
+            }
+        }
+
+        Ok(None)
     }
 
     /// Discover devices using D-Bus (BlueZ)
@@ -194,9 +309,9 @@ impl BluetoothConnector for LinuxBluetoothConnector {
         }
 
         tracing::debug!("Sent {} bytes", sent);
-        // TODO: Implement proper ACK parsing for Linux (similar to Windows)
-        // For now, return None to indicate no seq number update
-        Ok(None)
+
+        // Wait for ACK response and send ACK back (bidirectional protocol)
+        self.wait_for_ack(fd)
     }
 
     fn receive(&mut self) -> BluetoothResult<Vec<u8>> {

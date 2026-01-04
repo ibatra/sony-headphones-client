@@ -27,9 +27,14 @@ impl BluetoothConnector for MacOSBluetoothConnector {
         Err(BluetoothError::PlatformNotSupported)
     }
 
-    fn connect(&mut self, address: &str) -> BluetoothResult<()> {
+    fn connect(&mut self, _address: &str) -> BluetoothResult<()> {
         // TODO: Implement macOS RFCOMM connection
         // Use IOBluetoothRFCOMMChannel
+        Err(BluetoothError::PlatformNotSupported)
+    }
+
+    fn connect_with_name(&mut self, _address: &str, _name: Option<&str>) -> BluetoothResult<()> {
+        // TODO: Implement macOS RFCOMM connection
         Err(BluetoothError::PlatformNotSupported)
     }
 
@@ -38,7 +43,8 @@ impl BluetoothConnector for MacOSBluetoothConnector {
         Ok(())
     }
 
-    fn send(&mut self, _data: &[u8]) -> BluetoothResult<()> {
+    fn send(&mut self, _data: &[u8]) -> BluetoothResult<Option<u8>> {
+        // TODO: Implement send with ACK handling when macOS support is added
         Err(BluetoothError::NotConnected)
     }
 
