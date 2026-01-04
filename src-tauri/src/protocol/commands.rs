@@ -183,9 +183,22 @@ pub fn build_sound_position(position: SoundPositionPreset) -> Vec<u8> {
 // Battery Commands
 // ============================================================================
 
-/// Build command to inquire battery level
-pub fn build_battery_inquiry() -> Vec<u8> {
+/// Build command to inquire battery level (old style)
+pub fn build_battery_inquiry_old() -> Vec<u8> {
     vec![CommandType::BatteryGetLevel as u8, 0x01]
+}
+
+/// Build command to inquire battery level
+/// `inquiry_type`:
+/// - 0x00 = Single battery (over-ear headphones)
+/// - 0x01 = Left/Right battery (earbuds)
+/// - 0x02 = Case/Cradle battery
+/// - 0x08 = Battery with threshold (single)
+/// - 0x09 = L/R battery with threshold
+/// - 0x0A = Case battery with threshold
+pub fn build_battery_inquiry(inquiry_type: u8) -> Vec<u8> {
+    // Use POWER_GET_PARAM (0x26) with the inquiry type
+    vec![CommandType::PowerGetParam as u8, inquiry_type]
 }
 
 /// Build command to get battery capability (single vs dual battery)

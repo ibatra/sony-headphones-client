@@ -12,6 +12,7 @@ pub mod codec;
 pub mod commands;
 pub mod constants;
 pub mod models;
+pub mod parser;
 
 // Re-export commonly used items
 pub use codec::{
@@ -37,3 +38,4 @@ pub use models::{
     BatteryStatus, CustomEq, DseeType, EqPreset, HeadphoneModel, ModelCapabilities,
     ProtocolVersion, SpeakToChat, SpeakToChatSensitivity,
 };
+pub use parser::{parse_response, ParsedResponse};

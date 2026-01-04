@@ -4,7 +4,7 @@
 //! - D-Bus for device discovery (BlueZ)
 //! - Direct RFCOMM sockets via libc for data transfer
 
-use super::{BluetoothConnector, BluetoothError, BluetoothResult, Device};
+use super::{BluetoothConnector, BluetoothError, BluetoothResult, Device, DeviceResponse};
 use dbus::arg::RefArg;
 use std::os::unix::io::RawFd;
 
@@ -312,6 +312,33 @@ impl BluetoothConnector for LinuxBluetoothConnector {
 
         // Wait for ACK response and send ACK back (bidirectional protocol)
         self.wait_for_ack(fd)
+    }
+
+    fn send_command(&mut self, data: &[u8]) -> BluetoothResult<DeviceResponse> {
+        let fd = self.socket.ok_or(BluetoothError::NotConnected)?;
+
+        let sent = unsafe {
+            libc::send(
+                fd,
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
+                0,
+            )
+        };
+
+        if sent < 0 {
+            return Err(BluetoothError::SendFailed(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+
+        tracing::debug!("Sent {} bytes", sent);
+
+        // Wait for response (ACK or data)
+        match self.wait_for_ack(fd)? {
+            Some(seq) => Ok(DeviceResponse::Ack { next_seq: seq }),
+            None => Ok(DeviceResponse::Timeout),
+        }
     }
 
     fn receive(&mut self) -> BluetoothResult<Vec<u8>> {

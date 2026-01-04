@@ -59,6 +59,51 @@ pub enum BluetoothError {
 /// Result type for Bluetooth operations
 pub type BluetoothResult<T> = Result<T, BluetoothError>;
 
+/// Response from device after sending a command
+/// Captures both ACK responses and data responses (which were previously discarded)
+#[derive(Debug, Clone)]
+pub enum DeviceResponse {
+    /// ACK response with next sequence number
+    Ack { next_seq: u8 },
+    /// Data response (battery notifications, status updates, etc.)
+    /// Previously these were silently dropped - now we capture them
+    Data {
+        data_type: u8,
+        seq: u8,
+        payload: Vec<u8>,
+    },
+    /// Timeout - no response received within timeout period
+    Timeout,
+}
+
+impl DeviceResponse {
+    /// Get sequence number if this is an ACK response (for backwards compatibility)
+    pub fn ack_seq(&self) -> Option<u8> {
+        match self {
+            DeviceResponse::Ack { next_seq } => Some(*next_seq),
+            _ => None,
+        }
+    }
+
+    /// Check if this is an ACK response
+    pub fn is_ack(&self) -> bool {
+        matches!(self, DeviceResponse::Ack { .. })
+    }
+
+    /// Check if this contains data payload
+    pub fn is_data(&self) -> bool {
+        matches!(self, DeviceResponse::Data { .. })
+    }
+
+    /// Get data payload if this is a data response
+    pub fn data_payload(&self) -> Option<&[u8]> {
+        match self {
+            DeviceResponse::Data { payload, .. } => Some(payload),
+            _ => None,
+        }
+    }
+}
+
 /// Bluetooth connector trait - platform implementations must implement this
 pub trait BluetoothConnector: Send + Sync {
     /// Discover available Sony headphones
@@ -75,7 +120,12 @@ pub trait BluetoothConnector: Send + Sync {
 
     /// Send data to the connected device
     /// Returns the next sequence number from ACK response (if received)
+    /// DEPRECATED: Use send_command() for new code to capture full device responses
     fn send(&mut self, data: &[u8]) -> BluetoothResult<Option<u8>>;
+
+    /// Send data and receive full device response (ACK or data)
+    /// This captures data responses that were previously discarded
+    fn send_command(&mut self, data: &[u8]) -> BluetoothResult<DeviceResponse>;
 
     /// Receive data from the connected device
     fn receive(&mut self) -> BluetoothResult<Vec<u8>>;
@@ -191,6 +241,16 @@ pub mod mock {
             // Simulate sequence number alternating (like real device)
             self.seq_number = if self.seq_number == 0 { 1 } else { 0 };
             Ok(Some(self.seq_number))
+        }
+
+        fn send_command(&mut self, data: &[u8]) -> BluetoothResult<DeviceResponse> {
+            if !self.connected {
+                return Err(BluetoothError::NotConnected);
+            }
+            tracing::debug!("Mock: Sent {} bytes", data.len());
+            // Simulate sequence number alternating (like real device)
+            self.seq_number = if self.seq_number == 0 { 1 } else { 0 };
+            Ok(DeviceResponse::Ack { next_seq: self.seq_number })
         }
 
         fn receive(&mut self) -> BluetoothResult<Vec<u8>> {

@@ -3,7 +3,7 @@
 //! This module provides Bluetooth RFCOMM connectivity on macOS using:
 //! - IOBluetooth framework for device discovery and RFCOMM
 
-use super::{BluetoothConnector, BluetoothError, BluetoothResult, Device};
+use super::{BluetoothConnector, BluetoothError, BluetoothResult, Device, DeviceResponse};
 
 /// macOS Bluetooth connector using IOBluetooth
 pub struct MacOSBluetoothConnector {
@@ -45,6 +45,11 @@ impl BluetoothConnector for MacOSBluetoothConnector {
 
     fn send(&mut self, _data: &[u8]) -> BluetoothResult<Option<u8>> {
         // TODO: Implement send with ACK handling when macOS support is added
+        Err(BluetoothError::NotConnected)
+    }
+
+    fn send_command(&mut self, _data: &[u8]) -> BluetoothResult<DeviceResponse> {
+        // TODO: Implement send_command when macOS support is added
         Err(BluetoothError::NotConnected)
     }
 

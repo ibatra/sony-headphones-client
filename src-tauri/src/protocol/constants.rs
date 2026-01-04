@@ -88,10 +88,17 @@ pub enum CommandType {
     EqSetParam = 88,            // 0x58 - EQEBB_SET_PARAM (set)
     EqNotify = 89,              // 0x59 - EQEBB_NTFY_PARAM
 
-    // Battery commands
+    // Battery commands (old style)
     BatteryGetCapability = 16,  // 0x10 - Get battery capability
     BatteryGetLevel = 18,       // 0x12 - Get battery level
     BatteryNotify = 19,         // 0x13 - Battery level notification
+
+    // Power/Battery commands (new style - POWER_*)
+    // Reference: ProtocolV2T1.hpp Command enum
+    PowerGetParam = 38,         // 0x26 - POWER_GET_PARAM
+    PowerRetParam = 39,         // 0x27 - POWER_RET_PARAM
+    PowerSetParam = 40,         // 0x28 - POWER_SET_PARAM
+    PowerNotifyParam = 41,      // 0x29 - POWER_NTFY_PARAM
 
     // Speak-to-chat / System commands (XM5+)
     SpeakToChatGetParam = 246,  // 0xF6 - SYSTEM_GET_PARAM

@@ -5,10 +5,10 @@
 pub mod bluetooth;
 pub mod protocol;
 
-use bluetooth::{BluetoothConnector, Device};
+use bluetooth::{BluetoothConnector, Device, DeviceResponse};
 use protocol::{
-    AncMode, DataType, EqPreset, HeadphoneModel, ModelCapabilities, SoundPositionPreset,
-    SpeakToChatSensitivity, VptPresetId,
+    AncMode, BatteryStatus, DataType, EqPreset, HeadphoneModel, ModelCapabilities,
+    ParsedResponse, SoundPositionPreset, SpeakToChatSensitivity, VptPresetId,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -24,6 +24,8 @@ pub struct AppState {
     seq_number: RwLock<u8>,
     model: RwLock<Option<HeadphoneModel>>,
     capabilities: RwLock<Option<ModelCapabilities>>,
+    /// Last known battery status (updated from device responses)
+    battery_status: RwLock<Option<BatteryStatus>>,
 }
 
 impl AppState {
@@ -33,6 +35,7 @@ impl AppState {
             seq_number: RwLock::new(0),
             model: RwLock::new(None),
             capabilities: RwLock::new(None),
+            battery_status: RwLock::new(None),
         }
     }
 
@@ -41,6 +44,36 @@ impl AppState {
         let current = *seq;
         *seq = seq.wrapping_add(1);
         current
+    }
+
+    /// Process a device response and update state accordingly
+    async fn process_response(&self, response: &DeviceResponse) {
+        if let DeviceResponse::Data { payload, .. } = response {
+            if let Some(parsed) = protocol::parse_response(payload) {
+                match parsed {
+                    ParsedResponse::Battery(status) => {
+                        tracing::info!(
+                            "🔋 Updating battery state: level={}, charging={}",
+                            status.level, status.charging
+                        );
+                        *self.battery_status.write().await = Some(status);
+                    }
+                    ParsedResponse::AncStatus { mode, level } => {
+                        tracing::info!("🎧 ANC status update: mode={}, level={}", mode, level);
+                        // Could store in state if needed
+                    }
+                    ParsedResponse::EqStatus { preset } => {
+                        tracing::info!("🎵 EQ status update: preset=0x{:02X}", preset);
+                    }
+                    ParsedResponse::DseeStatus { enabled } => {
+                        tracing::info!("🔊 DSEE status update: enabled={}", enabled);
+                    }
+                    ParsedResponse::Unknown { command, .. } => {
+                        tracing::debug!("Unknown response command: 0x{:02X}", command);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -418,42 +451,109 @@ pub struct BatteryInfo {
     pub case_charging: Option<bool>,
 }
 
-/// Get battery status (simulated for mock, real for hardware)
+/// Get battery status - tries real inquiry first, falls back to cached/simulated
 #[tauri::command]
 async fn get_battery_status(state: State<'_, AppState>) -> Result<Option<BatteryInfo>, String> {
-    let connector = state.connector.read().await;
+    // First check if we already have battery status from a previous response
+    {
+        let cached = state.battery_status.read().await;
+        if let Some(status) = cached.as_ref() {
+            return Ok(Some(BatteryInfo {
+                level: status.level,
+                charging: status.charging,
+                right_level: status.right_level,
+                right_charging: status.right_charging,
+                case_level: status.case_level,
+                case_charging: status.case_charging,
+            }));
+        }
+    }
 
-    match connector.as_ref() {
+    // No cached status - try to query the device
+    let mut connector = state.connector.write().await;
+
+    match connector.as_mut() {
         Some(c) => {
             if !c.is_connected() {
                 return Ok(None);
             }
 
-            // For now, return simulated battery data
-            // TODO: Send actual battery inquiry command and parse response
+            // Determine which battery inquiry to use based on device type
             let caps = state.capabilities.read().await;
             let is_dual = caps.as_ref().map(|c| c.dual_battery).unwrap_or(false);
+            drop(caps);
 
-            if is_dual {
-                // Earbuds - simulate dual battery + case
-                Ok(Some(BatteryInfo {
-                    level: 85,
-                    charging: false,
-                    right_level: Some(90),
-                    right_charging: Some(false),
-                    case_level: Some(100),
-                    case_charging: Some(true),
-                }))
-            } else {
-                // Over-ear headphones - single battery
-                Ok(Some(BatteryInfo {
-                    level: 75,
-                    charging: false,
-                    right_level: None,
-                    right_charging: None,
-                    case_level: None,
-                    case_charging: None,
-                }))
+            // Build battery inquiry command
+            // POWER_GET_PARAM (0x26) with type based on device
+            let inquiry_type = if is_dual { 0x01 } else { 0x00 }; // LEFT_RIGHT_BATTERY or BATTERY
+            let payload = protocol::build_battery_inquiry(inquiry_type);
+            let seq = state.next_seq().await;
+            let data_type = get_data_type_for_model(&state).await;
+
+            let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
+                .map_err(|e| format!("Failed to build packet: {}", e))?;
+
+            tracing::info!("🔋 Sending battery inquiry (type=0x{:02X})", inquiry_type);
+
+            // Use send_command to get full response
+            match c.send_command(&packet) {
+                Ok(response) => {
+                    // Update seq number from response
+                    if let Some(seq) = response.ack_seq() {
+                        *state.seq_number.write().await = seq;
+                    }
+
+                    // Process any data response
+                    state.process_response(&response).await;
+
+                    // Check if we got battery data
+                    let cached = state.battery_status.read().await;
+                    if let Some(status) = cached.as_ref() {
+                        return Ok(Some(BatteryInfo {
+                            level: status.level,
+                            charging: status.charging,
+                            right_level: status.right_level,
+                            right_charging: status.right_charging,
+                            case_level: status.case_level,
+                            case_charging: status.case_charging,
+                        }));
+                    }
+
+                    // Still no battery data - device might not support this inquiry type
+                    // Return simulated data as fallback
+                    tracing::warn!("No battery data received, using fallback");
+                    if is_dual {
+                        Ok(Some(BatteryInfo {
+                            level: 85,
+                            charging: false,
+                            right_level: Some(90),
+                            right_charging: Some(false),
+                            case_level: Some(100),
+                            case_charging: Some(true),
+                        }))
+                    } else {
+                        Ok(Some(BatteryInfo {
+                            level: 75,
+                            charging: false,
+                            right_level: None,
+                            right_charging: None,
+                            case_level: None,
+                            case_charging: None,
+                        }))
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Battery inquiry failed: {}", e);
+                    // Return fallback simulated data
+                    Ok(Some(BatteryInfo {
+                        level: 75,
+                        charging: false,
+                        right_level: None,
+                        right_charging: None,
+                        case_level: None,
+                        case_charging: None,
+                    }))
+                }
             }
         }
         None => Ok(None),

@@ -2,7 +2,7 @@
 //!
 //! Uses Windows Bluetooth APIs for device discovery and Winsock BTH for RFCOMM.
 
-use super::{BluetoothConnector, BluetoothError, BluetoothResult, Device};
+use super::{BluetoothConnector, BluetoothError, BluetoothResult, Device, DeviceResponse};
 use std::mem::{size_of, zeroed};
 use windows::core::GUID;
 use windows::Win32::Devices::Bluetooth::{
@@ -261,16 +261,30 @@ impl WindowsBluetoothConnector {
         Ok(())
     }
 
-    /// Wait for ACK response from headphones with timeout
+    /// Format bytes as hex dump for logging (first N bytes)
+    fn hex_dump(data: &[u8], max_bytes: usize) -> String {
+        let len = data.len().min(max_bytes);
+        let hex: Vec<String> = data[..len].iter().map(|b| format!("{:02X}", b)).collect();
+        if data.len() > max_bytes {
+            format!("[{}... ({} more)]", hex.join(" "), data.len() - max_bytes)
+        } else {
+            format!("[{}]", hex.join(" "))
+        }
+    }
+
+    /// Wait for response from headphones with timeout
     /// The protocol uses START_MARKER ('>') and END_MARKER ('<') for message framing
-    /// Returns the next sequence number from the ACK (if received)
+    /// Returns DeviceResponse capturing ACK, data, or timeout
     ///
-    /// ACK format after unescaping: [data_type, seq_num, size[4], checksum]
+    /// Response format after unescaping: [data_type, seq_num, size[4], payload..., checksum]
     /// - data_type 0x01 = ACK
-    /// - seq_num = next sequence number to use
-    fn wait_for_ack(&mut self) -> BluetoothResult<Option<u8>> {
+    /// - data_type 0x0C = DATA_MDR (device data response)
+    /// - data_type 0x0E = DATA_MDR_NO2 (alternate data response)
+    fn wait_for_response(&mut self) -> BluetoothResult<DeviceResponse> {
         const TIMEOUT_MS: u32 = 1000;
         const ACK_DATA_TYPE: u8 = 0x01;
+        const DATA_MDR: u8 = 0x0C;
+        const DATA_MDR_NO2: u8 = 0x0E;
 
         // Set receive timeout on socket
         let timeout_val: i32 = TIMEOUT_MS as i32;
@@ -293,7 +307,7 @@ impl WindowsBluetoothConnector {
 
         // Read until we get a complete message (END_MARKER) or timeout
         loop {
-            let mut chunk = [0u8; 256];
+            let mut chunk = [0u8; 512]; // Increased buffer for larger data responses
             let n = unsafe {
                 recv(
                     self.socket,
@@ -307,14 +321,15 @@ impl WindowsBluetoothConnector {
                 // Timeout (WSAETIMEDOUT = 10060) or error
                 let err = unsafe { WSAGetLastError() };
                 if err.0 == 10060 {
-                    tracing::debug!("ACK timeout after {} bytes", total_received);
+                    tracing::warn!("⏱️  Response timeout after {} bytes received", total_received);
                 } else if err.0 != 0 {
-                    tracing::warn!("ACK receive error: {}", err.0);
+                    tracing::warn!("❌ Receive error: {} after {} bytes", err.0, total_received);
                 }
-                break;
+                return Ok(DeviceResponse::Timeout);
             }
 
             total_received += n as usize;
+            tracing::debug!("📥 Received chunk: {} bytes (total: {})", n, total_received);
 
             // Parse received bytes looking for message frame
             for &byte in &chunk[..n as usize] {
@@ -323,43 +338,92 @@ impl WindowsBluetoothConnector {
                     buffer.clear();
                 } else if byte == END_MARKER && found_start {
                     // Complete message received - parse it
-                    // Buffer format: [data_type, seq_num, size[4], checksum]
-                    // Note: data may be escaped, but ACK messages typically don't contain escape-needing bytes
+                    // Buffer format: [data_type, seq_num, size[4], payload..., checksum]
                     if buffer.len() >= 2 {
                         let data_type = buffer[0];
-                        let next_seq = buffer[1];
+                        let seq = buffer[1];
+
+                        // Log the response with hex dump
+                        let type_name = match data_type {
+                            ACK_DATA_TYPE => "ACK",
+                            DATA_MDR => "DATA_MDR",
+                            DATA_MDR_NO2 => "DATA_MDR_NO2",
+                            _ => "UNKNOWN",
+                        };
+                        tracing::info!(
+                            "📨 Response: type=0x{:02X}({}) seq={} size={} bytes\n   Hex: {}",
+                            data_type, type_name, seq, buffer.len(),
+                            Self::hex_dump(&buffer, 48)
+                        );
 
                         if data_type == ACK_DATA_TYPE {
-                            tracing::info!("ACK received: next_seq={}, {} bytes total", next_seq, total_received);
-                            // Send ACK back to device (bidirectional protocol requirement)
-                            self.send_ack(next_seq)?;
-                            return Ok(Some(next_seq));
+                            // ACK response - send ACK back and return
+                            self.send_ack(seq)?;
+                            return Ok(DeviceResponse::Ack { next_seq: seq });
+                        } else if data_type == DATA_MDR || data_type == DATA_MDR_NO2 {
+                            // Data response - ACK it and return the data
+                            // This is crucial: we must ACK data responses too!
+                            self.send_ack(seq)?;
+                            tracing::info!(
+                                "🔋 Data response captured: {} bytes (previously discarded!)",
+                                buffer.len()
+                            );
+                            return Ok(DeviceResponse::Data {
+                                data_type,
+                                seq,
+                                payload: buffer.clone(),
+                            });
                         } else {
-                            // Not an ACK, might be a data response - log and continue
-                            tracing::debug!("Received non-ACK response: type=0x{:02X}, {} bytes", data_type, buffer.len());
+                            // Unknown type - still ACK and capture
+                            self.send_ack(seq)?;
+                            tracing::warn!(
+                                "⚠️  Unknown response type 0x{:02X}, capturing anyway",
+                                data_type
+                            );
+                            return Ok(DeviceResponse::Data {
+                                data_type,
+                                seq,
+                                payload: buffer.clone(),
+                            });
                         }
                     }
-                    return Ok(None);
+                    // Buffer too small to be valid
+                    tracing::warn!("⚠️  Invalid response: buffer only {} bytes", buffer.len());
+                    return Ok(DeviceResponse::Timeout);
                 } else if found_start {
                     buffer.push(byte);
                 }
             }
 
             // Safety limit - don't read forever
-            if total_received > 4096 {
-                tracing::warn!("ACK response too large, stopping");
+            if total_received > 8192 {
+                tracing::warn!("⚠️  Response too large ({} bytes), stopping", total_received);
                 break;
             }
         }
 
-        // Don't fail if no ACK - some commands may not require it
-        Ok(None)
+        Ok(DeviceResponse::Timeout)
+    }
+
+    /// Legacy wait_for_ack - wraps wait_for_response for backwards compatibility
+    fn wait_for_ack(&mut self) -> BluetoothResult<Option<u8>> {
+        match self.wait_for_response()? {
+            DeviceResponse::Ack { next_seq } => Ok(Some(next_seq)),
+            DeviceResponse::Data { seq, .. } => {
+                // Data response received instead of ACK - return seq for compatibility
+                // The data is logged but lost in legacy API
+                Ok(Some(seq))
+            }
+            DeviceResponse::Timeout => Ok(None),
+        }
     }
 }
 
 impl BluetoothConnector for WindowsBluetoothConnector {
     fn discover_devices(&self) -> BluetoothResult<Vec<Device>> {
         let mut devices = Vec::new();
+
+        tracing::info!("🔍 Starting Bluetooth device discovery...");
 
         // Set up search parameters
         let mut search_params: BLUETOOTH_DEVICE_SEARCH_PARAMS = unsafe { zeroed() };
@@ -380,12 +444,18 @@ impl BluetoothConnector for WindowsBluetoothConnector {
 
         let handle = match find_result {
             Ok(h) => h,
-            Err(_) => return Ok(devices), // No devices found
+            Err(e) => {
+                tracing::info!("🔍 No Bluetooth devices found (error: {:?})", e);
+                return Ok(devices);
+            }
         };
 
         if handle.is_invalid() {
+            tracing::info!("🔍 Invalid handle - no devices found");
             return Ok(devices);
         }
+
+        let mut all_found = Vec::new(); // Track all found devices for logging
 
         loop {
             // Get device name from wide string
@@ -395,6 +465,12 @@ impl BluetoothConnector for WindowsBluetoothConnector {
                 .position(|&c| c == 0)
                 .unwrap_or(device_info.szName.len());
             let name = String::from_utf16_lossy(&device_info.szName[..name_len]);
+            let address = Self::format_address(unsafe { device_info.Address.Anonymous.ullLong });
+
+            // Get device flags for debugging
+            let is_connected = device_info.fConnected.as_bool();
+            let is_remembered = device_info.fRemembered.as_bool();
+            let is_authenticated = device_info.fAuthenticated.as_bool();
 
             // Filter for Sony headphones
             let name_lower = name.to_lowercase();
@@ -402,12 +478,28 @@ impl BluetoothConnector for WindowsBluetoothConnector {
             // Skip BLE-only devices (they have "LE_" prefix and won't work for RFCOMM)
             let is_le_only = name_lower.starts_with("le_") || name_lower.starts_with("le-");
 
-            if !is_le_only && (name_lower.contains("wh-1000xm")
-                || name_lower.contains("wf-1000xm")
-                || name_lower.contains("sony"))
-            {
-                let address = Self::format_address(unsafe { device_info.Address.Anonymous.ullLong });
+            // Determine device type for logging
+            let device_type = if is_le_only { "BLE" } else { "Classic" };
+            let status = format!(
+                "connected={} remembered={} authenticated={}",
+                is_connected, is_remembered, is_authenticated
+            );
 
+            // Log ALL devices found (not just Sony ones) for debugging
+            let is_sony = name_lower.contains("wh-1000xm")
+                || name_lower.contains("wf-1000xm")
+                || name_lower.contains("sony");
+
+            all_found.push(format!(
+                "  {} [{}] @ {} ({}) {}",
+                name,
+                device_type,
+                address,
+                status,
+                if is_sony { "← Sony" } else { "" }
+            ));
+
+            if !is_le_only && is_sony {
                 // Only skip exact address duplicates
                 let already_exists = devices.iter().any(|d| d.address == address);
                 if !already_exists {
@@ -415,10 +507,25 @@ impl BluetoothConnector for WindowsBluetoothConnector {
                     let display_name = if devices.iter().any(|d| d.name == name) {
                         format!("{} [{}]", name, &address[address.len()-5..])
                     } else {
-                        name
+                        name.clone()
                     };
+
+                    tracing::info!(
+                        "✅ Adding device: {} @ {} ({})",
+                        display_name, address, device_type
+                    );
                     devices.push(Device { name: display_name, address });
+                } else {
+                    tracing::debug!(
+                        "⏭️  Skipping duplicate address: {} @ {}",
+                        name, address
+                    );
                 }
+            } else if is_le_only && is_sony {
+                tracing::info!(
+                    "⏭️  Skipping BLE-only Sony device: {} @ {} (won't work for RFCOMM)",
+                    name, address
+                );
             }
 
             // Find next device
@@ -429,6 +536,14 @@ impl BluetoothConnector for WindowsBluetoothConnector {
         }
 
         let _ = unsafe { BluetoothFindDeviceClose(handle) };
+
+        // Log summary
+        tracing::info!(
+            "🔍 Discovery complete. Found {} Bluetooth devices:\n{}",
+            all_found.len(),
+            all_found.join("\n")
+        );
+        tracing::info!("📋 Filtered to {} Sony devices for selection", devices.len());
 
         Ok(devices)
     }
@@ -456,6 +571,13 @@ impl BluetoothConnector for WindowsBluetoothConnector {
             return Err(BluetoothError::NotConnected);
         }
 
+        // Log outgoing packet with hex dump
+        tracing::info!(
+            "📤 Sending {} bytes:\n   Hex: {}",
+            data.len(),
+            Self::hex_dump(data, 48)
+        );
+
         let result = unsafe {
             send(
                 self.socket,
@@ -470,7 +592,7 @@ impl BluetoothConnector for WindowsBluetoothConnector {
             // Connection-related errors - mark socket as disconnected
             // 10053 = WSAECONNABORTED, 10054 = WSAECONNRESET, 10057 = WSAENOTCONN
             if err.0 == 10053 || err.0 == 10054 || err.0 == 10057 {
-                tracing::warn!("Connection lost (error {}), marking as disconnected", err.0);
+                tracing::warn!("❌ Connection lost (error {}), marking as disconnected", err.0);
                 unsafe { closesocket(self.socket) };
                 self.socket = INVALID_SOCKET;
                 self.connected_device = None;
@@ -479,13 +601,53 @@ impl BluetoothConnector for WindowsBluetoothConnector {
             return Err(BluetoothError::SendFailed(format!("Send failed: {}", err.0)));
         }
 
-        tracing::debug!("Sent {} bytes", data.len());
+        tracing::debug!("✅ Sent {} bytes successfully", data.len());
 
         // Wait for ACK response from headphones (blocking with timeout)
         // This is required to keep the protocol in sync - the C++ implementation
         // also blocks waiting for ACK after each command
         // Returns the next sequence number from the ACK
         self.wait_for_ack()
+    }
+
+    fn send_command(&mut self, data: &[u8]) -> BluetoothResult<DeviceResponse> {
+        if self.socket == INVALID_SOCKET {
+            return Err(BluetoothError::NotConnected);
+        }
+
+        // Log outgoing packet with hex dump
+        tracing::info!(
+            "📤 Sending command: {} bytes\n   Hex: {}",
+            data.len(),
+            Self::hex_dump(data, 48)
+        );
+
+        let result = unsafe {
+            send(
+                self.socket,
+                data.as_ptr(),
+                data.len() as i32,
+                0,
+            )
+        };
+
+        if result < 0 {
+            let err = unsafe { WSAGetLastError() };
+            // Connection-related errors - mark socket as disconnected
+            if err.0 == 10053 || err.0 == 10054 || err.0 == 10057 {
+                tracing::warn!("❌ Connection lost (error {}), marking as disconnected", err.0);
+                unsafe { closesocket(self.socket) };
+                self.socket = INVALID_SOCKET;
+                self.connected_device = None;
+                return Err(BluetoothError::NotConnected);
+            }
+            return Err(BluetoothError::SendFailed(format!("Send failed: {}", err.0)));
+        }
+
+        tracing::debug!("✅ Sent {} bytes, waiting for response...", data.len());
+
+        // Wait for full response (ACK or data) from headphones
+        self.wait_for_response()
     }
 
     fn receive(&mut self) -> BluetoothResult<Vec<u8>> {
