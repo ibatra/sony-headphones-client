@@ -76,27 +76,27 @@ impl From<u8> for DataType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CommandType {
-    // Sound/audio commands
-    VptSetParam = 72,           // 0x48 - Virtual surround
+    // Sound/audio commands (LEA = LE Audio - XM3/XM4 specific, may not work on XM5/XM6)
+    VptSetParam = 72,           // 0x48 - LEA_SET_PARAM (VPT/Sound Position - XM3/XM4 only)
     NcAsmSetParam = 104,        // 0x68 - NC/ASM set
     NcAsmGetParam = 102,        // 0x66 - NC/ASM get/inquiry
     NcAsmNotify = 103,          // 0x67 - NC/ASM status notification
 
-    // EQ commands
-    EqGetCapability = 86,       // 0x56 - Get EQ capabilities
-    EqGetParam = 88,            // 0x58 - Get current EQ
-    EqSetParam = 90,            // 0x5A - Set EQ
-    EqNotify = 89,              // 0x59 - EQ status notification
+    // EQ commands (EQEBB in protocol spec)
+    EqGetCapability = 82,       // 0x52 - EQEBB_GET_STATUS
+    EqGetParam = 86,            // 0x56 - EQEBB_GET_PARAM (inquiry)
+    EqSetParam = 88,            // 0x58 - EQEBB_SET_PARAM (set)
+    EqNotify = 89,              // 0x59 - EQEBB_NTFY_PARAM
 
     // Battery commands
     BatteryGetCapability = 16,  // 0x10 - Get battery capability
     BatteryGetLevel = 18,       // 0x12 - Get battery level
     BatteryNotify = 19,         // 0x13 - Battery level notification
 
-    // Speak-to-chat (XM5+)
-    SpeakToChatGetParam = 244,  // 0xF4 - Get speak-to-chat settings
-    SpeakToChatSetParam = 246,  // 0xF6 - Set speak-to-chat settings
-    SpeakToChatNotify = 245,    // 0xF5 - Speak-to-chat notification
+    // Speak-to-chat / System commands (XM5+)
+    SpeakToChatGetParam = 246,  // 0xF6 - SYSTEM_GET_PARAM
+    SpeakToChatSetParam = 248,  // 0xF8 - SYSTEM_SET_PARAM
+    SpeakToChatNotify = 249,    // 0xF9 - SYSTEM_NTFY_PARAM
 
     // DSEE (audio upsampling)
     DseeGetParam = 230,         // 0xE6 - Get DSEE setting

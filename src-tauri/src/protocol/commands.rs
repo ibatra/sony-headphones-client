@@ -236,32 +236,35 @@ pub fn build_eq_custom(bands: &[u8], bass_level: u8) -> Vec<u8> {
 // ============================================================================
 
 /// Build command to get speak-to-chat settings
+/// Uses SMART_TALKING_MODE_TYPE1 = 0x02 as inquired type
 pub fn build_speak_to_chat_get() -> Vec<u8> {
-    vec![CommandType::SpeakToChatGetParam as u8, 0x01]
+    vec![CommandType::SpeakToChatGetParam as u8, 0x02]
 }
 
 /// Build command to set speak-to-chat
 /// enabled: whether the feature is on
-/// sensitivity: Low/Medium/High
-/// timeout: auto-close timeout (typically 5, 10, 15, or 0 for never)
+/// sensitivity: Low/Medium/High (maps to DetectSensitivity: AUTO=0, HIGH=1, LOW=2)
+/// timeout: auto-close timeout (maps to ModeOutTime: FAST=0, MID=1, SLOW=2, NONE=3)
 pub fn build_speak_to_chat_set(enabled: bool, sensitivity: SpeakToChatSensitivity, timeout: u8) -> Vec<u8> {
+    // Reference: DetectSensitivity enum - AUTO=0, HIGH=1, LOW=2
     let sensitivity_byte = match sensitivity {
-        SpeakToChatSensitivity::Low => 0x01,
-        SpeakToChatSensitivity::Medium => 0x02,
-        SpeakToChatSensitivity::High => 0x03,
+        SpeakToChatSensitivity::High => 0x01,   // HIGH
+        SpeakToChatSensitivity::Medium => 0x00, // AUTO (medium maps to auto)
+        SpeakToChatSensitivity::Low => 0x02,    // LOW
     };
 
+    // Reference: ModeOutTime enum - FAST=0 (~5s), MID=1 (~15s), SLOW=2 (~30s), NONE=3 (don't end)
     let timeout_byte = match timeout {
-        0 => 0x00,  // Never
-        5 => 0x01,  // Short
-        10 => 0x02, // Standard
-        15 => 0x03, // Long
-        _ => 0x02,  // Default to standard
+        0 => 0x03,  // Never (NONE)
+        5 => 0x00,  // Fast (~5s)
+        10 | 15 => 0x01, // Mid (~15s)
+        30 => 0x02, // Slow (~30s)
+        _ => 0x01,  // Default to mid
     };
 
     vec![
         CommandType::SpeakToChatSetParam as u8,
-        0x01,                      // Inquiry type
+        0x02,                      // SMART_TALKING_MODE_TYPE1 inquired type
         if enabled { 0x01 } else { 0x00 },
         sensitivity_byte,
         timeout_byte,
