@@ -469,6 +469,15 @@ async fn get_battery_status(state: State<'_, AppState>) -> Result<Option<Battery
 async fn set_equalizer(state: State<'_, AppState>, preset: String) -> Result<CommandResult, String> {
     let eq_preset = match preset.as_str() {
         "off" => EqPreset::Off,
+        // Genre presets
+        "rock" => EqPreset::Rock,
+        "pop" => EqPreset::Pop,
+        "jazz" => EqPreset::Jazz,
+        "dance" => EqPreset::Dance,
+        "edm" => EqPreset::Edm,
+        "rnb" | "rnb_hip_hop" | "hip_hop" => EqPreset::RnbHipHop,
+        "acoustic" => EqPreset::Acoustic,
+        // Sony presets
         "bright" => EqPreset::Bright,
         "excited" => EqPreset::Excited,
         "mellow" => EqPreset::Mellow,
@@ -631,6 +640,81 @@ async fn set_dsee(state: State<'_, AppState>, enabled: bool) -> Result<CommandRe
 }
 
 // ============================================================================
+// Volume Commands
+// ============================================================================
+
+/// Set volume level (0-30)
+#[tauri::command]
+async fn set_volume(state: State<'_, AppState>, level: u8) -> Result<CommandResult, String> {
+    let payload = protocol::build_volume_set(level);
+    let seq = state.next_seq().await;
+    let data_type = get_data_type_for_model(&state).await;
+    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
+        .map_err(|e| format!("Failed to build packet: {}", e))?;
+
+    let mut connector = state.connector.write().await;
+    match connector.as_mut() {
+        Some(c) => {
+            if !c.is_connected() {
+                return Ok(CommandResult::err("Not connected"));
+            }
+            match c.send(&packet) {
+                Ok(next_seq) => {
+                    if let Some(seq) = next_seq {
+                        *state.seq_number.write().await = seq;
+                    }
+                    Ok(CommandResult::ok(format!("Volume set to {}", level.min(30))))
+                }
+                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
+            }
+        }
+        None => Ok(CommandResult::err("Bluetooth not initialized")),
+    }
+}
+
+// ============================================================================
+// Playback Commands
+// ============================================================================
+
+/// Send playback control command
+#[tauri::command]
+async fn playback_control(state: State<'_, AppState>, action: String) -> Result<CommandResult, String> {
+    let control = match action.as_str() {
+        "play" => protocol::PlaybackControl::Play,
+        "pause" => protocol::PlaybackControl::Pause,
+        "next" | "track_up" => protocol::PlaybackControl::TrackUp,
+        "prev" | "previous" | "track_down" => protocol::PlaybackControl::TrackDown,
+        "stop" => protocol::PlaybackControl::Stop,
+        _ => return Ok(CommandResult::err("Invalid action")),
+    };
+
+    let payload = protocol::build_playback_control(control);
+    let seq = state.next_seq().await;
+    let data_type = get_data_type_for_model(&state).await;
+    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
+        .map_err(|e| format!("Failed to build packet: {}", e))?;
+
+    let mut connector = state.connector.write().await;
+    match connector.as_mut() {
+        Some(c) => {
+            if !c.is_connected() {
+                return Ok(CommandResult::err("Not connected"));
+            }
+            match c.send(&packet) {
+                Ok(next_seq) => {
+                    if let Some(seq) = next_seq {
+                        *state.seq_number.write().await = seq;
+                    }
+                    Ok(CommandResult::ok(format!("Playback: {}", action)))
+                }
+                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
+            }
+        }
+        None => Ok(CommandResult::err("Bluetooth not initialized")),
+    }
+}
+
+// ============================================================================
 // App Entry Point
 // ============================================================================
 
@@ -779,6 +863,8 @@ pub fn run() {
             set_custom_eq,
             set_speak_to_chat,
             set_dsee,
+            set_volume,
+            playback_control,
         ])
         .setup(|app| {
             tracing::info!("App setup complete");

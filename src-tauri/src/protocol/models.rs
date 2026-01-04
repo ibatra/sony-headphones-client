@@ -352,20 +352,31 @@ impl BatteryStatus {
 }
 
 /// EQ preset identifiers
+/// Values from reference: ProtocolV2T1.hpp EqPresetId
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EqPreset {
-    Off = 0,
-    Bright = 1,
-    Excited = 2,
-    Mellow = 3,
-    Relaxed = 4,
-    Vocal = 5,
-    Treble = 6,
-    Bass = 7,
-    Speech = 8,
-    Custom1 = 160,
-    Custom2 = 161,
+    Off = 0x00,
+    // Genre presets (0x01-0x07)
+    Rock = 0x01,
+    Pop = 0x02,
+    Jazz = 0x03,
+    Dance = 0x04,
+    Edm = 0x05,
+    RnbHipHop = 0x06,
+    Acoustic = 0x07,
+    // Sony presets (0x10-0x17)
+    Bright = 0x10,
+    Excited = 0x11,
+    Mellow = 0x12,
+    Relaxed = 0x13,
+    Vocal = 0x14,
+    Treble = 0x15,
+    Bass = 0x16,
+    Speech = 0x17,
+    // Custom presets
+    Custom1 = 0xA0,
+    Custom2 = 0xA1,
 }
 
 /// Custom EQ band settings

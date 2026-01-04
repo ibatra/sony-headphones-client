@@ -105,6 +105,52 @@ pub enum CommandType {
 
     // Device info
     DeviceInfoInquiry = 0,      // 0x00 - Device info inquiry
+
+    // Playback commands (PLAY_*)
+    PlayGetCapability = 160,    // 0xA0 - Get playback capabilities
+    PlayGetStatus = 162,        // 0xA2 - Get playback status
+    PlaySetStatus = 164,        // 0xA4 - Set playback control (play/pause/skip)
+    PlayGetParam = 166,         // 0xA6 - Get playback parameters (volume)
+    PlaySetParam = 168,         // 0xA8 - Set playback parameters (volume)
+}
+
+/// Playback inquired type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum PlayInquiredType {
+    PlaybackControl = 0x01,             // Playback control with volume adjustment
+    PlaybackControlWithFunctionChange = 0x03,
+    MusicVolume = 0x20,                 // Music volume (0-30)
+    CallVolume = 0x21,                  // Call volume
+    MusicVolumeWithMute = 0x30,
+    CallVolumeWithMute = 0x31,
+    PlayMode = 0x40,
+}
+
+/// Playback control actions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum PlaybackControl {
+    KeyOff = 0x00,
+    Pause = 0x01,
+    TrackUp = 0x02,     // Next track
+    TrackDown = 0x03,   // Previous track
+    GroupUp = 0x04,
+    GroupDown = 0x05,
+    Stop = 0x06,
+    Play = 0x07,
+    FastForward = 0x08,
+    FastRewind = 0x09,
+}
+
+/// Playback status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum PlaybackStatus {
+    Unsettled = 0x00,
+    Play = 0x01,
+    Pause = 0x02,
+    Stop = 0x03,
 }
 
 /// NC/ASM inquired type

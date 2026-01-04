@@ -3,6 +3,7 @@
 
 use super::constants::*;
 use super::models::{EqPreset, SpeakToChatSensitivity};
+pub use super::constants::{PlaybackControl, PlayInquiredType};
 
 /// Get dual/single value based on ASM level
 pub fn get_dual_single_for_asm_level(asm_level: u8) -> NcDualSingleValue {
@@ -299,6 +300,60 @@ pub fn build_nc_asm_inquiry() -> Vec<u8> {
         CommandType::NcAsmGetParam as u8,
         NcAsmInquiredType::NoiseCancellingAndAmbientSoundMode as i8 as u8,
     ]
+}
+
+// ============================================================================
+// Volume Commands
+// ============================================================================
+
+/// Build command to set music volume (0-30)
+pub fn build_volume_set(volume: u8) -> Vec<u8> {
+    vec![
+        CommandType::PlaySetParam as u8,
+        PlayInquiredType::MusicVolume as u8,
+        volume.min(30),  // Clamp to 0-30
+    ]
+}
+
+/// Build command to get current volume
+pub fn build_volume_get() -> Vec<u8> {
+    vec![
+        CommandType::PlayGetParam as u8,
+        PlayInquiredType::MusicVolume as u8,
+    ]
+}
+
+// ============================================================================
+// Playback Control Commands
+// ============================================================================
+
+/// Build command to send playback control (play/pause/skip)
+pub fn build_playback_control(control: PlaybackControl) -> Vec<u8> {
+    vec![
+        CommandType::PlaySetStatus as u8,
+        PlayInquiredType::PlaybackControl as u8,
+        control as u8,
+    ]
+}
+
+/// Build play command
+pub fn build_play() -> Vec<u8> {
+    build_playback_control(PlaybackControl::Play)
+}
+
+/// Build pause command
+pub fn build_pause() -> Vec<u8> {
+    build_playback_control(PlaybackControl::Pause)
+}
+
+/// Build next track command
+pub fn build_next_track() -> Vec<u8> {
+    build_playback_control(PlaybackControl::TrackUp)
+}
+
+/// Build previous track command
+pub fn build_prev_track() -> Vec<u8> {
+    build_playback_control(PlaybackControl::TrackDown)
 }
 
 #[cfg(test)]

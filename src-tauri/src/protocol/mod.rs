@@ -23,10 +23,14 @@ pub use commands::{
     build_eq_capability_inquiry, build_eq_custom, build_eq_get, build_eq_preset, build_nc_asm_inquiry,
     build_noise_cancelling_off, build_noise_cancelling_on, build_sound_position,
     build_speak_to_chat_get, build_speak_to_chat_set, build_vpt_preset,
+    // Volume and playback
+    build_volume_set, build_volume_get, build_playback_control,
+    build_play, build_pause, build_next_track, build_prev_track,
 };
 pub use constants::{
     AncMode, AsmId, AsmSettingType, CommandType, DataType, NcAsmEffect, NcAsmInquiredType,
     NcAsmSettingType, NcDualSingleValue, SoundPositionPreset, VptInquiredType, VptPresetId,
+    PlaybackControl, PlaybackStatus, PlayInquiredType,
     MAX_BLUETOOTH_MESSAGE_SIZE, MAX_STEPS_WH_1000_XM3, SERVICE_UUID, SERVICE_UUID_BYTES,
 };
 pub use models::{
