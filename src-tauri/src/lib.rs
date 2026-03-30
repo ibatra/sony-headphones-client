@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, State,
+    AppHandle, Emitter, Manager, State, WindowEvent,
 };
 use tokio::sync::RwLock;
 
@@ -39,10 +39,14 @@ impl AppState {
         }
     }
 
+    /// Get the current sequence number and toggle it for the next call.
+    /// Sony protocol alternates between 0 and 1.
+    /// We toggle on every send attempt (success, timeout, or error) so we
+    /// never get permanently stuck on a seq the device has already processed.
     async fn next_seq(&self) -> u8 {
         let mut seq = self.seq_number.write().await;
         let current = *seq;
-        *seq = seq.wrapping_add(1);
+        *seq = if current == 0 { 1 } else { 0 };
         current
     }
 
@@ -167,17 +171,23 @@ fn get_protocol_info() -> String {
 /// Initialize Bluetooth connector
 #[tauri::command]
 async fn init_bluetooth(state: State<'_, AppState>) -> Result<CommandResult, String> {
+    // Use write lock for atomic check-and-set (prevents race with auto_connect)
+    let mut conn = state.connector.write().await;
+    if conn.is_some() {
+        tracing::info!("Bluetooth already initialized, skipping re-init");
+        return Ok(CommandResult::ok("Bluetooth already initialized"));
+    }
+
     match bluetooth::create_connector() {
-        Ok(connector) => {
-            *state.connector.write().await = Some(connector);
+        Ok(new_connector) => {
+            *conn = Some(new_connector);
             Ok(CommandResult::ok("Bluetooth initialized"))
         }
         Err(e) => {
-            // Fallback to mock mode (useful for WSL or testing without hardware)
             tracing::warn!("Real Bluetooth failed ({}), falling back to mock mode", e);
             match bluetooth::mock::MockBluetoothConnector::new() {
                 Ok(mock) => {
-                    *state.connector.write().await = Some(Box::new(mock));
+                    *conn = Some(Box::new(mock));
                     Ok(CommandResult::ok("Bluetooth initialized (simulation mode)"))
                 }
                 Err(me) => Ok(CommandResult::err(format!("Failed to initialize: {} (mock also failed: {})", e, me))),
@@ -274,20 +284,50 @@ async fn get_capabilities(state: State<'_, AppState>) -> Result<Option<Capabilit
     Ok(caps.as_ref().map(CapabilitiesInfo::from))
 }
 
-/// Get the appropriate DataType for the connected model
+/// Get the appropriate DataType for the connected model (for settings commands: ANC, EQ, DSEE, etc.)
 async fn get_data_type_for_model(state: &State<'_, AppState>) -> DataType {
     let model = state.model.read().await;
     match model.as_ref() {
         Some(m) => {
             use protocol::HeadphoneModel::*;
             match m {
-                // XM6 uses DataMdr (0x0C) for NC/ASM commands (discovered from traffic capture)
                 Xm6 => DataType::DataMdr,
-                Xm5 | WfXm5 => DataType::DataMdrNo2, // V3 protocol
-                _ => DataType::DataMdr, // V1/V2 protocol
+                Xm5 | WfXm5 => DataType::DataMdrNo2,
+                _ => DataType::DataMdr,
             }
         }
         None => DataType::DataMdr,
+    }
+}
+
+/// Centralized command sender — builds packet, sends, handles ACK, processes response.
+/// Serializes access to the connector to prevent concurrent command issues.
+async fn send_command_to_device(
+    state: &State<'_, AppState>,
+    payload: &[u8],
+    data_type: DataType,
+) -> Result<CommandResult, String> {
+    let mut connector = state.connector.write().await;
+    match connector.as_mut() {
+        Some(c) => {
+            if !c.is_connected() {
+                return Ok(CommandResult::err("Not connected"));
+            }
+
+            // next_seq toggles automatically (0→1→0→1)
+            let seq = state.next_seq().await;
+            let packet = protocol::package_for_bluetooth(payload, data_type, seq)
+                .map_err(|e| format!("Failed to build packet: {}", e))?;
+
+            match c.send_command(&packet) {
+                Ok(response) => {
+                    state.process_response(&response).await;
+                    Ok(CommandResult::ok("OK"))
+                }
+                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
+            }
+        }
+        None => Ok(CommandResult::err("Bluetooth not initialized")),
     }
 }
 
@@ -333,30 +373,8 @@ async fn set_anc_mode(
             None => (protocol::build_anc_command(anc_mode), DataType::DataMdr),
         }
     };
-    let seq = state.next_seq().await;
     tracing::info!("Sending ANC command with DataType::{:?}, payload: {:02X?}", data_type, payload);
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    // Update sequence number from ACK response
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok("ANC mode set"))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 /// Set VPT preset
@@ -372,29 +390,8 @@ async fn set_vpt_preset(state: State<'_, AppState>, preset: String) -> Result<Co
     };
 
     let payload = protocol::build_vpt_preset(preset_id);
-    let seq = state.next_seq().await;
     let data_type = get_data_type_for_model(&state).await;
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok("VPT preset set"))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 /// Set sound position
@@ -411,29 +408,8 @@ async fn set_sound_position(state: State<'_, AppState>, position: String) -> Res
     };
 
     let payload = protocol::build_sound_position(pos);
-    let seq = state.next_seq().await;
     let data_type = get_data_type_for_model(&state).await;
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok("Sound position set"))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 // ============================================================================
@@ -493,17 +469,10 @@ async fn get_battery_status(state: State<'_, AppState>) -> Result<Option<Battery
             let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
                 .map_err(|e| format!("Failed to build packet: {}", e))?;
 
-            tracing::info!("🔋 Sending battery inquiry (type=0x{:02X})", inquiry_type);
+            tracing::info!("Sending battery inquiry (type=0x{:02X})", inquiry_type);
 
-            // Use send_command to get full response
             match c.send_command(&packet) {
                 Ok(response) => {
-                    // Update seq number from response
-                    if let Some(seq) = response.ack_seq() {
-                        *state.seq_number.write().await = seq;
-                    }
-
-                    // Process any data response
                     state.process_response(&response).await;
 
                     // Check if we got battery data
@@ -590,29 +559,8 @@ async fn set_equalizer(state: State<'_, AppState>, preset: String) -> Result<Com
     };
 
     let payload = protocol::build_eq_preset(eq_preset);
-    let seq = state.next_seq().await;
     let data_type = get_data_type_for_model(&state).await;
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok("EQ preset set"))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 /// Set custom equalizer bands
@@ -627,29 +575,8 @@ async fn set_custom_eq(
     }
 
     let payload = protocol::build_eq_custom(&bands, bass_level);
-    let seq = state.next_seq().await;
     let data_type = get_data_type_for_model(&state).await;
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok("Custom EQ set"))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 // ============================================================================
@@ -681,29 +608,8 @@ async fn set_speak_to_chat(
     };
 
     let payload = protocol::build_speak_to_chat_set(enabled, sens, timeout);
-    let seq = state.next_seq().await;
     let data_type = get_data_type_for_model(&state).await;
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok("Speak-to-chat settings updated"))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 // ============================================================================
@@ -714,29 +620,8 @@ async fn set_speak_to_chat(
 #[tauri::command]
 async fn set_dsee(state: State<'_, AppState>, enabled: bool) -> Result<CommandResult, String> {
     let payload = protocol::build_dsee_set(enabled);
-    let seq = state.next_seq().await;
     let data_type = get_data_type_for_model(&state).await;
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok(if enabled { "DSEE enabled" } else { "DSEE disabled" }))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 // ============================================================================
@@ -747,29 +632,8 @@ async fn set_dsee(state: State<'_, AppState>, enabled: bool) -> Result<CommandRe
 #[tauri::command]
 async fn set_volume(state: State<'_, AppState>, level: u8) -> Result<CommandResult, String> {
     let payload = protocol::build_volume_set(level);
-    let seq = state.next_seq().await;
     let data_type = get_data_type_for_model(&state).await;
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok(format!("Volume set to {}", level.min(30))))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 // ============================================================================
@@ -789,29 +653,8 @@ async fn playback_control(state: State<'_, AppState>, action: String) -> Result<
     };
 
     let payload = protocol::build_playback_control(control);
-    let seq = state.next_seq().await;
     let data_type = get_data_type_for_model(&state).await;
-    let packet = protocol::package_for_bluetooth(&payload, data_type, seq)
-        .map_err(|e| format!("Failed to build packet: {}", e))?;
-
-    let mut connector = state.connector.write().await;
-    match connector.as_mut() {
-        Some(c) => {
-            if !c.is_connected() {
-                return Ok(CommandResult::err("Not connected"));
-            }
-            match c.send(&packet) {
-                Ok(next_seq) => {
-                    if let Some(seq) = next_seq {
-                        *state.seq_number.write().await = seq;
-                    }
-                    Ok(CommandResult::ok(format!("Playback: {}", action)))
-                }
-                Err(e) => Ok(CommandResult::err(format!("Send failed: {}", e))),
-            }
-        }
-        None => Ok(CommandResult::err("Bluetooth not initialized")),
-    }
+    send_command_to_device(&state, &payload, data_type).await
 }
 
 // ============================================================================
@@ -819,23 +662,123 @@ async fn playback_control(state: State<'_, AppState>, action: String) -> Result<
 // ============================================================================
 
 /// Setup system tray with menu
+/// Auto-connect to the first Sony headphone found on startup.
+/// Runs in background so it doesn't block the app launch.
+fn auto_connect(app_handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let state: State<'_, AppState> = app_handle.state();
+
+        // Initialize Bluetooth
+        match bluetooth::create_connector() {
+            Ok(connector) => {
+                *state.connector.write().await = Some(connector);
+                tracing::info!("Bluetooth initialized for auto-connect");
+            }
+            Err(e) => {
+                tracing::warn!("Auto-connect: Bluetooth init failed ({}), using mock", e);
+                if let Ok(mock) = bluetooth::mock::MockBluetoothConnector::new() {
+                    *state.connector.write().await = Some(Box::new(mock));
+                }
+                return;
+            }
+        }
+
+        // Discover devices
+        let devices = {
+            let connector = state.connector.read().await;
+            match connector.as_ref() {
+                Some(c) => match c.discover_devices() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("Auto-connect: Discovery failed: {}", e);
+                        return;
+                    }
+                },
+                None => return,
+            }
+        };
+
+        if devices.is_empty() {
+            tracing::info!("Auto-connect: No Sony headphones found");
+            return;
+        }
+
+        // Connect to the first Sony device found
+        let target = &devices[0];
+        tracing::info!(
+            "Auto-connect: Found {}, connecting...",
+            target.name
+        );
+
+        let connected_name = {
+            let mut connector = state.connector.write().await;
+            if let Some(c) = connector.as_mut() {
+                match c.connect_with_name(&target.address, Some(&target.name)) {
+                    Ok(_) => {
+                        if let Some(device) = c.connected_device() {
+                            let model = HeadphoneModel::from_device_name(&device.name);
+                            let capabilities = ModelCapabilities::for_model(model);
+                            let name = device.name.clone();
+
+                            tracing::info!(
+                                "Auto-connect: Connected to {} (model: {:?})",
+                                name,
+                                model
+                            );
+
+                            *state.model.write().await = Some(model);
+                            *state.capabilities.write().await = Some(capabilities);
+                            Some(name)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Auto-connect: Connection failed: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(name) = connected_name {
+            update_tray_title(&app_handle, &name);
+            // Notify the frontend that we auto-connected
+            let _ = app_handle.emit("device-connected", ());
+        }
+    });
+}
+
+/// Update the tray icon tooltip to show connection status
+fn update_tray_title(app: &AppHandle, device_name: &str) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(&format!("Sony Headphones - {}", device_name)));
+    }
+}
+
 fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // Create menu items
     let show_item = MenuItem::with_id(app, "show", "Open Sony Headphones", true, None::<&str>)?;
+    let separator1 = MenuItem::with_id(app, "sep1", "────────────", false, None::<&str>)?;
     let anc_off = MenuItem::with_id(app, "anc_off", "ANC: Off", true, None::<&str>)?;
     let anc_on = MenuItem::with_id(app, "anc_on", "ANC: On", true, None::<&str>)?;
     let anc_ambient = MenuItem::with_id(app, "anc_ambient", "ANC: Ambient", true, None::<&str>)?;
+    let separator2 = MenuItem::with_id(app, "sep2", "────────────", false, None::<&str>)?;
+    let reconnect_item = MenuItem::with_id(app, "reconnect", "Reconnect", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
     // Build menu
     let menu = Menu::with_items(
         app,
-        &[&show_item, &anc_off, &anc_on, &anc_ambient, &quit_item],
+        &[&show_item, &separator1, &anc_off, &anc_on, &anc_ambient, &separator2, &reconnect_item, &quit_item],
     )?;
 
     // Create tray icon
-    let _tray = TrayIconBuilder::new()
+    let _tray = TrayIconBuilder::with_id("main-tray")
         .icon(app.default_window_icon().unwrap().clone())
+        .tooltip("Sony Headphones")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
@@ -846,6 +789,10 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
+                }
+                "reconnect" => {
+                    let app_handle = app.clone();
+                    auto_connect(app_handle);
                 }
                 "anc_off" | "anc_on" | "anc_ambient" => {
                     let mode = match id {
@@ -867,8 +814,6 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                             _ => AncMode::Off,
                         };
 
-                        let seq = state.next_seq().await;
-
                         // Get correct payload and data type for model
                         let (payload, data_type) = {
                             let model = state.model.read().await;
@@ -876,12 +821,10 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                                 Some(m) => {
                                     use protocol::HeadphoneModel::*;
                                     match m {
-                                        // XM6 uses new protocol with inquired type 0x19 and DataMdr
                                         Xm6 => (
                                             protocol::build_anc_command_xm6(anc_mode),
                                             DataType::DataMdr,
                                         ),
-                                        // XM5/WF-XM5 use V3 protocol
                                         Xm5 | WfXm5 => (
                                             protocol::build_anc_command_v3(anc_mode),
                                             DataType::DataMdrNo2,
@@ -893,15 +836,14 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
-                        if let Ok(packet) =
-                            protocol::package_for_bluetooth(&payload, data_type, seq)
-                        {
-                            let mut connector = state.connector.write().await;
-                            if let Some(c) = connector.as_mut() {
-                                if c.is_connected() {
-                                    if let Ok(Some(next_seq)) = c.send(&packet) {
-                                        *state.seq_number.write().await = next_seq;
-                                    }
+                        let mut connector = state.connector.write().await;
+                        if let Some(c) = connector.as_mut() {
+                            if c.is_connected() {
+                                let seq = state.next_seq().await;
+                                if let Ok(packet) =
+                                    protocol::package_for_bluetooth(&payload, data_type, seq)
+                                {
+                                    let _ = c.send_command(&packet);
                                 }
                             }
                         }
@@ -972,7 +914,16 @@ pub fn run() {
             if let Err(e) = setup_tray(app.handle()) {
                 tracing::error!("Failed to setup tray: {}", e);
             }
+            // Auto-connect to headphones in background
+            auto_connect(app.handle().clone());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Hide window on close instead of quitting (keeps running in tray)
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

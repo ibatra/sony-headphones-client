@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
   // Types
@@ -71,19 +72,51 @@
   let vptPreset = $state("off");
   let soundPosition = $state("off");
 
-  // Initialize
+  let connectionStatus = $state("Initializing...");
+
+  // Initialize and auto-connect
   onMount(async () => {
     try {
-      await invoke("init_bluetooth");
-      await checkConnection();
-
       const appWindow = getCurrentWindow();
       await appWindow.onCloseRequested(async (event) => {
         event.preventDefault();
         await appWindow.hide();
       });
+
+      // Listen for backend auto-connect events
+      listen("device-connected", async () => {
+        await checkConnection();
+      });
+
+      // Check if backend already connected (auto_connect may have finished)
+      connectionStatus = "Checking connection...";
+      await checkConnection();
+
+      if (connectedDevice) {
+        connectionStatus = `Connected to ${connectedDevice.name}`;
+        return;
+      }
+
+      // Not connected yet — initialize bluetooth and auto-connect from frontend
+      connectionStatus = "Initializing Bluetooth...";
+      await invoke("init_bluetooth");
+
+      // Poll for backend auto-connect (it runs in parallel)
+      for (let i = 0; i < 10; i++) {
+        await new Promise(r => setTimeout(r, 1500));
+        await checkConnection();
+        if (connectedDevice) {
+          connectionStatus = `Connected to ${connectedDevice.name}`;
+          return;
+        }
+        connectionStatus = `Waiting for headphones... (${i + 1}/10)`;
+      }
+
+      // Still not connected — let user manually scan
+      connectionStatus = "Not connected";
     } catch (e) {
       error = `Failed to initialize: ${e}`;
+      connectionStatus = "Error";
     }
   });
 
@@ -175,8 +208,12 @@
   }
 
   async function setAncMode() {
-    if (!connectedDevice) return;
+    if (!connectedDevice) {
+      error = "Not connected — waiting for headphones";
+      return;
+    }
     try {
+      error = null;
       const result = await invoke<CommandResult>("set_anc_mode", {
         mode: ancMode,
         level: ancMode === "ambient" ? ambientLevel : null,
@@ -184,7 +221,7 @@
       });
       if (!result.success) error = result.message;
     } catch (e) {
-      error = `Failed to set ANC: ${e}`;
+      error = `ANC failed: ${e}`;
     }
   }
 
@@ -284,7 +321,7 @@
         {#if connectedDevice}
           {capabilities?.model || 'Connected'}
         {:else}
-          Not connected
+          {connectionStatus}
         {/if}
       </p>
     </div>
@@ -441,16 +478,13 @@
                 <span class="text-sm text-[var(--color-text-secondary)]">Ambient Level</span>
                 <span class="text-sm font-medium text-[var(--color-accent)]">{ambientLevel}</span>
               </div>
-              <div class="slider-track">
-                <div class="slider-fill" style="width: {(ambientLevel / (capabilities?.max_ambient_level ?? 20)) * 100}%"></div>
-              </div>
               <input
                 type="range"
                 min="0"
                 max={capabilities?.max_ambient_level ?? 20}
                 bind:value={ambientLevel}
                 onchange={setAncMode}
-                class="w-full h-2 mt-[-8px] opacity-0 cursor-pointer relative z-10"
+                class="styled-slider"
               />
             </div>
 
@@ -475,18 +509,15 @@
           <h2 class="text-sm font-medium text-[var(--color-text-secondary)]">Volume</h2>
           <span class="text-lg font-semibold text-[var(--color-text-primary)]">{volume}</span>
         </div>
-        <div class="slider-track">
-          <div class="slider-fill" style="width: {(volume / 30) * 100}%"></div>
-        </div>
         <input
           type="range"
           min="0"
           max="30"
           bind:value={volume}
           onchange={setVolume}
-          class="w-full h-2 mt-[-8px] opacity-0 cursor-pointer relative z-10"
+          class="styled-slider"
         />
-        <div class="flex justify-between mt-2 text-xs text-[var(--color-text-muted)]">
+        <div class="flex justify-between mt-1 text-xs text-[var(--color-text-muted)]">
           <span>0</span>
           <span>30</span>
         </div>
