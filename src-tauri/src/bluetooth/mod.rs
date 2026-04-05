@@ -135,6 +135,15 @@ pub trait BluetoothConnector: Send + Sync {
 
     /// Get the connected device info
     fn connected_device(&self) -> Option<&Device>;
+
+    /// Read and ACK any pending notifications from the device.
+    /// The headphones send notifications (playback state, ANC changes, etc.)
+    /// over RFCOMM and expect ACKs. Without ACKing, gesture state gets out of sync.
+    /// Returns the number of notifications drained.
+    fn drain_notifications(&mut self) -> BluetoothResult<usize> {
+        // Default no-op for platforms that don't need it
+        Ok(0)
+    }
 }
 
 /// Create a platform-specific Bluetooth connector
