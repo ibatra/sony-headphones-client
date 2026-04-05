@@ -10,16 +10,7 @@
     "frontendDist": "../build"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Sony Headphones",
-        "width": 420,
-        "height": 700,
-        "resizable": true,
-        "minWidth": 380,
-        "minHeight": 500
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }
@@ -33,6 +24,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "infoPlist": "Info.plist"
+    }
   }
 }

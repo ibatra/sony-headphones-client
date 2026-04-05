@@ -6,13 +6,22 @@
 	<string>com.ishaan.sony-headphones-client</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Applications/Sony Headphones.app/Contents/MacOS/Sony Headphones</string>
+		<string>/Users/houndsito/Library/Sony Headphones/sony-headphones-client</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<false/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
 	<key>ProcessType</key>
-	<string>Interactive</string>
+	<string>Background</string>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/sony-headphones.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/sony-headphones.log</string>
 </dict>
 </plist>

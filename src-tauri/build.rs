@@ -7,9 +7,10 @@ fn main() {
             .flag("-fno-objc-arc") // Use manual reference counting
             .compile("macos_bluetooth_bridge");
 
-        // Link IOBluetooth and Foundation frameworks
+        // Link IOBluetooth, Foundation, and AppKit frameworks
         println!("cargo:rustc-link-lib=framework=IOBluetooth");
         println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=AppKit");
     }
 
     tauri_build::build()

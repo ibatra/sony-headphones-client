@@ -10,6 +10,7 @@
 
 #import <IOBluetooth/IOBluetooth.h>
 #import <Foundation/Foundation.h>
+#import <AppKit/NSApplication.h>
 #include <string.h>
 #include <dispatch/dispatch.h>
 
@@ -102,6 +103,15 @@ typedef struct {
 // ============================================================================
 // C API - called from Rust via FFI
 // ============================================================================
+
+/// Hide the app from the Dock and Cmd-Tab switcher.
+/// Must be called early, before any windows are created.
+void sony_bt_hide_from_dock(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        NSLog(@"[SonyBT] Hidden from Dock");
+    });
+}
 
 /// Discover all paired Bluetooth devices.
 /// Returns the number of devices written to out_devices (up to max_count).
@@ -201,32 +211,33 @@ void *sony_bt_connect(const char *address, int *out_error) {
                 }
             }
 
-            // Try opening with the discovered channel, or fall back to common channels
+            // Try RFCOMM channels. Channel 9 is the known stable channel for
+            // Sony headphones on macOS. The SPP/SDP channel (varies: 23, 26, etc.)
+            // connects but the headphones close it after ~17 seconds.
+            // So try channel 9 first, then SDP channel, then other fallbacks.
             IOBluetoothRFCOMMChannel *channel = nil;
             IOReturn status = kIOReturnError;
 
-            if (channelID != 0) {
-                NSLog(@"[SonyBT] Trying SDP channel %d", channelID);
-                status = [device openRFCOMMChannelSync:&channel
-                                        withChannelID:channelID
-                                             delegate:conn];
-            }
+            // Priority order: 9 first (stable), then SDP channel, then 5, 1
+            BluetoothRFCOMMChannelID tryChannels[5];
+            int tryCount = 0;
 
-            // Fall back to trying common RFCOMM channels
-            if (status != kIOReturnSuccess || !channel) {
-                BluetoothRFCOMMChannelID channels[] = {9, 5, 1, 2, 3, 4, 6, 7, 8};
-                int numChannels = sizeof(channels) / sizeof(channels[0]);
-                for (int i = 0; i < numChannels; i++) {
-                    if (channels[i] == channelID) continue; // Already tried
-                    channel = nil;
-                    NSLog(@"[SonyBT] Trying RFCOMM channel %d", channels[i]);
-                    status = [device openRFCOMMChannelSync:&channel
-                                            withChannelID:channels[i]
-                                                 delegate:conn];
-                    if (status == kIOReturnSuccess && channel) {
-                        NSLog(@"[SonyBT] Connected on RFCOMM channel %d", channels[i]);
-                        break;
-                    }
+            tryChannels[tryCount++] = 9; // Known stable for Sony
+            if (channelID != 0 && channelID != 9) {
+                tryChannels[tryCount++] = channelID; // SDP result
+            }
+            tryChannels[tryCount++] = 5;
+            tryChannels[tryCount++] = 1;
+
+            for (int i = 0; i < tryCount; i++) {
+                channel = nil;
+                NSLog(@"[SonyBT] Trying RFCOMM channel %d", tryChannels[i]);
+                status = [device openRFCOMMChannelSync:&channel
+                                        withChannelID:tryChannels[i]
+                                             delegate:conn];
+                if (status == kIOReturnSuccess && channel) {
+                    NSLog(@"[SonyBT] Connected on RFCOMM channel %d", tryChannels[i]);
+                    break;
                 }
             }
 

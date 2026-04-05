@@ -30,6 +30,7 @@ struct SonyBTDeviceInfo {
 
 // FFI declarations for the Objective-C bridge
 extern "C" {
+    fn sony_bt_hide_from_dock();
     fn sony_bt_discover(out_devices: *mut SonyBTDeviceInfo, max_count: c_int) -> c_int;
     fn sony_bt_connect(address: *const c_char, out_error: *mut c_int) -> *mut c_void;
     fn sony_bt_send(connection: *mut c_void, data: *const u8, length: c_int) -> c_int;
@@ -57,6 +58,9 @@ unsafe impl Sync for MacOSBluetoothConnector {}
 impl MacOSBluetoothConnector {
     /// Create a new macOS Bluetooth connector
     pub fn new() -> BluetoothResult<Self> {
+        // Hide from Dock — we're a background service
+        unsafe { sony_bt_hide_from_dock() };
+
         Ok(Self {
             connection: std::ptr::null_mut(),
             connected_device: None,
@@ -519,5 +523,72 @@ impl BluetoothConnector for MacOSBluetoothConnector {
 
     fn connected_device(&self) -> Option<&Device> {
         self.connected_device.as_ref()
+    }
+
+    fn drain_notifications(&mut self) -> BluetoothResult<usize> {
+        if self.connection.is_null() {
+            return Ok(0);
+        }
+
+        // Read raw bytes from the buffer (non-blocking, 0ms timeout).
+        let mut raw_buf = [0u8; 2048];
+        let n = unsafe {
+            sony_bt_receive(
+                self.connection,
+                raw_buf.as_mut_ptr(),
+                raw_buf.len() as c_int,
+                0, // non-blocking
+            )
+        };
+
+        if n <= 0 {
+            return Ok(0);
+        }
+
+        let data = &raw_buf[..n as usize];
+
+        // Parse Sony protocol messages (START 3E ... END 3C) and ACK them.
+        // The headphones re-transmit if we don't ACK fast enough, so we see
+        // duplicate messages. Only ACK the FIRST copy of each message —
+        // deduplicate by checking if we already ACKed this exact (data_type, seq) pair.
+        let mut count = 0;
+        let mut acked_in_this_batch: Vec<(u8, u8)> = Vec::new();
+        let mut i = 0;
+
+        while i < data.len() {
+            if data[i] == START_MARKER {
+                // Find the matching END_MARKER
+                if let Some(end_offset) = data[i + 1..].iter().position(|&b| b == END_MARKER) {
+                    let end = i + 1 + end_offset;
+                    let inner = &data[i + 1..end];
+                    if inner.len() >= 2 {
+                        let data_type = inner[0];
+                        let seq = inner[1];
+
+                        if data_type != ACK_DATA_TYPE {
+                            let key = (data_type, seq);
+                            if !acked_in_this_batch.contains(&key) {
+                                // First time seeing this (type, seq) — ACK it
+                                let _ = self.send_ack(seq);
+                                acked_in_this_batch.push(key);
+                                count += 1;
+                                tracing::debug!(
+                                    "ACKed notification: type=0x{:02X} seq={}",
+                                    data_type, seq
+                                );
+                            }
+                            // else: duplicate, skip
+                        }
+                    }
+                    i = end + 1;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        Ok(count)
     }
 }
